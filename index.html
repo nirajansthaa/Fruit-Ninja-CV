@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Fruit Ninja – Web (MediaPipe + Canvas)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; }
+    #game { display:block; width:100vw; height:100vh; }
+    #cam  { display:none; } /* video element is hidden; we draw it to canvas */
+    .hint { position:fixed; left:12px; bottom:10px; color:#fff; font:14px/1.3 system-ui,Segoe UI,Arial;
+            opacity:.7; user-select:none; }
+  </style>
+  <!-- MediaPipe Hands (classic JS API) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <video id="cam" autoplay playsinline muted></video>
+  <div class="hint">Q/ESC = quit tab · R = restart · F = fullscreen</div>
+
+<script>
+(async function(){
+  // ---------------- Config ----------------
+  const GAME_DURATION = 60;           // seconds
+  const SPAWN_EVERY   = [0.9, 1.8];   // base interval range (sec)
+  const SPAWN_RAMP_MIN= 0.45;         // interval shrinks to 45% by end
+  const MULTI_THRESH  = [20, 40];     // at 20s spawn 2 at once, at 40s spawn 3
+  const MAX_ONSCREEN  = 10;
+
+  const GRAVITY       = 2200;         // px/s^2
+  const FR_VY0        = [-1400, -2200]; // upward (negative)
+  const FR_VX0        = [-320, 320];  // sideways
+  const ROT_SPEED     = [3.0, 5.5];   // rad/s
+  const BOMB_CHANCE   = 0.18;
+
+  const SLICE_SPEED   = 1400;         // px/s
+  const SLASH_THICK   = 28;           // hitbox thickness around slash line
+  const SLASH_FRESH   = 0.12;         // sec (last sample must be fresher than this)
+  const CLEAR_AFTER_HIT = true;
+
+  const SLASH_VIS_THICK = 8;          // visual line thickness
+  const SLASH_GLOW_THICK= 14;
+
+  const FLASHBANG_DUR  = 0.50;        // seconds
+  const FLASHBANG_ALPHA= 220;         // 0..255
+  const SHAKE_DUR      = 0.35;        // seconds
+  const SHAKE_MAG      = 18;          // px
+
+  const RESTART_KEYS = new Set(['r','R']);
+  const QUIT_KEYS    = new Set(['q','Q']); // ESC handled separately
+
+  // ------------- Canvas & video -------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const video = document.getElementById('cam');
+
+  function resizeCanvas(){
+    canvas.width = Math.floor(window.innerWidth * devicePixelRatio);
+    canvas.height= Math.floor(window.innerHeight * devicePixelRatio);
+  }
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+
+  // Cover-fit the video into canvas (no letterbox)
+  function computeCoverDraw(videoW, videoH, canW, canH){
+    const scale = Math.max(canW/videoW, canH/videoH);
+    const newW = videoW*scale, newH = videoH*scale;
+    const x = (canW - newW)/2, y = (canH - newH)/2;
+    return {x, y, w:newW, h:newH, scale};
+  }
+
+  // Map normalized (0..1) video coords to canvas coords under cover-fit
+  function normToCanvas(nx, ny, cover, videoW, videoH){
+    return {
+      x: cover.x + nx*videoW*cover.scale,
+      y: cover.y + ny*videoH*cover.scale
+    };
+  }
+
+  // ------------- Assets -------------
+  async function loadImages(paths){
+    const load = (src)=>new Promise((res, rej)=>{
+      const im = new Image();
+      im.onload = ()=>res(im);
+      im.onerror= ()=>rej(new Error('Failed to load '+src));
+      im.src = src;
+    });
+    const imgs = [];
+    for (const p of paths) imgs.push(await load(p));
+    return imgs;
+  }
+
+  // Preload all PNGs found in assets folders. Adjust names as needed.
+
+  const fruitPaths = [
+    'assets/fruits/apple.png',
+    'assets/fruits/mango.png',
+    'assets/fruits/pear.png',
+    'assets/fruits/pineapple.png',
+    'assets/fruits/strawberry.png',
+  ];
+  const bombPaths  = [
+    'assets/bomb/bomb.png'
+  ];
+  const [fruitImgs, bombImgs] = await Promise.all([
+    loadImages(fruitPaths), loadImages(bombPaths)
+  ]);
+
+  // ------------- MediaPipe Hands -------------
+  let lastTip = null; // {xNorm, yNorm, tSec}
+  const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 0,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+  hands.onResults((res)=>{
+    if (res.multiHandLandmarks && res.multiHandLandmarks.length){
+      const lm = res.multiHandLandmarks[0][8]; // index tip
+      lastTip = { x: lm.x, y: lm.y, t: performance.now()/1000 };
+    } else {
+      lastTip = null;
+    }
+  });
+
+  const cam = new Camera(video, {
+    onFrame: async () => { await hands.send({ image: video }); },
+    width: 1280, height: 720
+  });
+
+  // Request camera from browser
+  await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+    .then(stream => { video.srcObject = stream; return new Promise(r=>video.onloadedmetadata=r); })
+    .catch(err => { alert('Camera error: '+err.message); throw err; });
+
+  cam.start();
+
+  // ------------- Game state -------------
+  const rnd = (a,b)=> a + Math.random()*(b-a);
+  const choice = (arr)=> arr[Math.floor(Math.random()*arr.length)];
+
+  class Particle {
+    constructor(x,y, vx,vy, life, col){
+      this.x=x; this.y=y; this.vx=vx; this.vy=vy; this.life=life; this.t=0; this.col=col||'rgba(255,0,0,1)';
+    }
+    update(dt){ this.x+=this.vx*dt; this.y+=this.vy*dt; this.vy += GRAVITY*0.3*dt; this.t+=dt; }
+    alive(){ return this.t < this.life; }
+    draw(ctx){
+      const a = 1 - this.t/this.life;
+      const r = Math.max(1, 3 + 8*a);
+      ctx.beginPath();
+      ctx.fillStyle = this.col;
+      ctx.arc(this.x, this.y, r, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function sliceImageToHalves(img, angle){
+    const w = img.width, h = img.height, cx=w/2, cy=h/2;
+
+    const mkHalf = (left)=> {
+      const off = document.createElement('canvas');
+      off.width = w; off.height = h;
+      const oc = off.getContext('2d');
+      oc.save();
+      oc.translate(cx, cy);
+      oc.rotate(angle);
+      oc.beginPath();
+      if (left) oc.rect(-w, -h, w, 2*h); // x<=0 half-plane
+      else      oc.rect(0, -h,  w, 2*h); // x>0 half-plane
+      oc.restore();
+      oc.clip();
+      oc.drawImage(img, 0, 0);
+      return off;
+    };
+    return [ mkHalf(true), mkHalf(false) ];
+  }
+
+  class Fruit {
+    constructor(img){
+      this.img = img;
+      this.x = rnd(150, canvas.width-150);
+      this.y = canvas.height + 40;
+      this.vx = rnd(FR_VX0[0], FR_VX0[1]);
+      this.vy = rnd(FR_VY0[0], FR_VY0[1]);
+      this.theta = rnd(0, Math.PI*2);
+      this.rotSpeed = rnd(ROT_SPEED[0], ROT_SPEED[1]) * (Math.random()<.5?-1:1);
+      this.sliced = false;
+      this.dead = false;
+      this.radius = Math.max(img.width, img.height)/2;
+    }
+    update(dt){
+      if (this.sliced) return;
+      this.x += this.vx*dt; this.y += this.vy*dt; this.vy += GRAVITY*dt;
+      this.theta += this.rotSpeed*dt;
+      if (this.y - 80 > canvas.height) this.dead = true;
+    }
+    draw(ctx){
+      if (this.sliced) return;
+      const scaleX = 0.35 + 0.65*Math.abs(Math.cos(this.theta)); // y-axis "spin"
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.scale(scaleX, 1);
+      ctx.drawImage(this.img, -this.img.width/2, -this.img.height/2);
+      ctx.restore();
+    }
+    center(){ return [this.x, this.y]; }
+    slice(angle){
+      this.sliced = true;
+      const [left, right] = sliceImageToHalves(this.img, angle);
+      const n = [-Math.sin(angle), Math.cos(angle)]; // normal
+      const kick = 380;
+
+      const h1 = new FruitHalf(left,  this.x, this.y, this.vx - n[0]*kick, this.vy - n[1]*kick, rnd(-6,6));
+      const h2 = new FruitHalf(right, this.x, this.y, this.vx + n[0]*kick, this.vy + n[1]*kick, rnd(-6,6));
+
+      const parts = [];
+      for (let i=0;i<16;i++){
+        const spd = rnd(120, 360);
+        const ang = angle + (rnd(-0.7, 0.7) + Math.PI/2) * (Math.random()<.5?-1:1);
+        parts.push(new Particle(this.x, this.y, Math.cos(ang)*spd, Math.sin(ang)*spd, rnd(0.25,0.45), 'rgba(255,50,50,0.9)'));
+      }
+      return { halves:[h1,h2], particles:parts };
+    }
+  }
+
+  class FruitHalf {
+    constructor(canvasHalf, x,y, vx,vy, spinSpeed){
+      this.h = canvasHalf;
+      this.x=x; this.y=y; this.vx=vx; this.vy=vy;
+      this.spin=0; this.spinSpeed=spinSpeed;
+      this.dead = false;
+    }
+    update(dt){
+      this.x+=this.vx*dt; this.y+=this.vy*dt; this.vy += GRAVITY*dt; this.spin+=this.spinSpeed*dt;
+      if (this.y - 60 > canvas.height) this.dead = true;
+    }
+    draw(ctx){
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.rotate(this.spin);
+      ctx.drawImage(this.h, -this.h.width/2, -this.h.height/2);
+      ctx.restore();
+    }
+  }
+
+  class Bomb {
+    constructor(img){
+      this.img = img;
+      this.x = rnd(150, canvas.width-150);
+      this.y = canvas.height + 40;
+      this.vx = rnd(FR_VX0[0], FR_VX0[1]);
+      this.vy = rnd(FR_VY0[0], FR_VY0[1]);
+      this.theta = rnd(0, Math.PI*2);
+      this.rotSpeed = rnd(ROT_SPEED[0], ROT_SPEED[1]) * (Math.random()<.5?-1:1);
+      this.triggered = false;
+      this.dead = false;
+      this.radius = Math.max(img.width, img.height)/2;
+    }
+    update(dt){
+      if (this.triggered) return;
+      this.x+=this.vx*dt; this.y+=this.vy*dt; this.vy += GRAVITY*dt; this.theta += this.rotSpeed*dt;
+      if (this.y - 80 > canvas.height) this.dead = true;
+    }
+    draw(ctx){
+      if (this.triggered) return;
+      const scaleX = 0.35 + 0.65*Math.abs(Math.cos(this.theta));
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.scale(scaleX, 1);
+      ctx.drawImage(this.img, -this.img.width/2, -this.img.height/2);
+      ctx.restore();
+    }
+    center(){ return [this.x, this.y]; }
+  }
+
+  // ------------- Slash history -------------
+  const trail = []; // {x,y,t}
+  let lastSeen = 0;
+
+  function addTrailPoint(x,y,t){
+    trail.push({x,y,t});
+    lastSeen = t;
+    // keep ~0.25s of history
+    const cutoff = t - 0.25;
+    while (trail.length && trail[0].t < cutoff) trail.shift();
+  }
+  function clearTrailIfStale(t){
+    if (t - lastSeen > SLASH_FRESH) trail.length = 0;
+  }
+  function computeSlashSegment(t){
+    if (trail.length < 2) return {speed:0, seg:null};
+    const p1 = trail[trail.length-1];
+    if (t - p1.t > SLASH_FRESH) return {speed:0, seg:null};
+    // find point at least 30ms earlier
+    for (let i=trail.length-2; i>=0; i--){
+      if (p1.t - trail[i].t >= 0.03){
+        const p0 = trail[i];
+        const dt = Math.max(1e-3, p1.t - p0.t);
+        const dx = p1.x - p0.x, dy = p1.y - p0.y;
+        const speed = Math.hypot(dx,dy) / dt;
+        return {speed, seg:[p0, p1]};
+      }
+    }
+    return {speed:0, seg:null};
+  }
+
+  function distPointToSegment(px,py, ax,ay, bx,by){
+    const apx=px-ax, apy=py-ay, abx=bx-ax, aby=by-ay;
+    const ab2 = abx*abx + aby*aby;
+    if (ab2 === 0) return Math.hypot(apx, apy);
+    let t = (apx*abx + apy*aby)/ab2; t = Math.max(0, Math.min(1, t));
+    const cx = ax + t*abx, cy = ay + t*aby;
+    return Math.hypot(px-cx, py-cy);
+  }
+
+  // ------------- Game loop state -------------
+  let fruits=[], bombs=[], halves=[], particles=[];
+  let score=0, gameOver=false;
+  let gameStart = performance.now()/1000;
+  let timeLeft = GAME_DURATION;
+  let nextSpawnAt = performance.now()/1000 + 0.6;
+  let flashT = 0, shakeT = 0;
+
+  function resetGame(){
+    fruits.length = bombs.length = halves.length = particles.length = 0;
+    trail.length = 0;
+    score=0; gameOver=false; flashT=0; shakeT=0;
+    gameStart = performance.now()/1000;
+    timeLeft = GAME_DURATION;
+    nextSpawnAt = gameStart + 0.6;
+  }
+
+  // ------------- Input -------------
+  document.addEventListener('keydown', (e)=>{
+    if (RESTART_KEYS.has(e.key)) resetGame();
+    if (QUIT_KEYS.has(e.key) || e.key === 'Escape') window.close?.();
+    if (e.key === 'f' || e.key === 'F'){
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(()=>{});
+      else document.exitFullscreen().catch(()=>{});
+    }
+  });
+
+  // ------------- Main loop -------------
+  let lastTime = performance.now()/1000;
+
+  function tick(){
+    const t = performance.now()/1000;
+    let dt = t - lastTime; if (dt > 0.033) dt = 0.033; lastTime = t;
+
+    // Timer
+    const elapsed = t - gameStart;
+    timeLeft = Math.max(0, GAME_DURATION - elapsed);
+    if (timeLeft <= 0 && !gameOver) gameOver = true;
+
+    // Compute video cover rect
+    const vW = video.videoWidth || 1280, vH = video.videoHeight || 720;
+    const cover = computeCoverDraw(vW, vH, canvas.width, canvas.height);
+
+    // Draw background (video)
+    ctx.clearRect(0,0,canvas.width, canvas.height);
+    ctx.save();
+    // Screen shake transform (ease-out)
+    if (shakeT > 0){
+      const k = shakeT / SHAKE_DUR;
+      const mag = (SHAKE_MAG * devicePixelRatio) * k;
+      const dx = (Math.random()*2-1)*mag;
+      const dy = (Math.random()*2-1)*mag;
+      ctx.translate(dx, dy);
+      shakeT = Math.max(0, shakeT - dt);
+    }
+    ctx.drawImage(video, cover.x, cover.y, cover.w, cover.h);
+
+    // Fingertip -> trail (map normalized to canvas under cover)
+    if (lastTip){
+      const pt = normToCanvas(lastTip.x, lastTip.y, cover, vW, vH);
+      addTrailPoint(pt.x, pt.y, t);
+    } else {
+      clearTrailIfStale(t);
+    }
+
+    // Spawning (ramps up over time)
+    if (!gameOver && t >= nextSpawnAt && (fruits.length + bombs.length) < MAX_ONSCREEN){
+      const ramp = SPAWN_RAMP_MIN + (1-SPAWN_RAMP_MIN)*(timeLeft/GAME_DURATION);
+      let spawns = 1 + (elapsed >= MULTI_THRESH[0] ? 1 : 0) + (elapsed >= MULTI_THRESH[1] ? 1 : 0);
+      while (spawns-- > 0){
+        if (Math.random() < BOMB_CHANCE) bombs.push(new Bomb(choice(bombImgs)));
+        else fruits.push(new Fruit(choice(fruitImgs)));
+      }
+      nextSpawnAt = t + rnd(SPAWN_EVERY[0]*ramp, SPAWN_EVERY[1]*ramp);
+    }
+
+    // Update physics (whole objects only)
+    for (const f of fruits) f.update(dt);
+    for (const b of bombs)  b.update(dt);
+
+    // Slash detection
+    const {speed, seg} = computeSlashSegment(t);
+    let didHit = false;
+    if (!gameOver && seg && speed > SLICE_SPEED){
+      const [a,b] = seg;
+      const angle = Math.atan2(b.y - a.y, b.x - a.x);
+
+      // Bombs first
+      for (const bo of bombs){
+        if (bo.dead || bo.triggered) continue;
+        const [cx, cy] = bo.center();
+        const d = distPointToSegment(cx, cy, a.x, a.y, b.x, b.y);
+        if (d <= bo.radius + SLASH_THICK){
+          bo.triggered = true;
+          score = Math.max(0, score - 3);
+          flashT = FLASHBANG_DUR; shakeT = SHAKE_DUR;
+          // Explosion particles
+          for (let i=0;i<36;i++){
+            const spd = rnd(300, 900);
+            const ang = rnd(0, Math.PI*2);
+            particles.push(new Particle(bo.x, bo.y, Math.cos(ang)*spd, Math.sin(ang)*spd, rnd(0.25,0.5), 'rgba(40,40,40,0.95)'));
+          }
+          didHit = true;
+          break; // at most one bomb per slash
+        }
+      }
+
+      // Fruits
+      for (const f of fruits){
+        if (f.dead || f.sliced) continue;
+        const [cx, cy] = f.center();
+        const d = distPointToSegment(cx, cy, a.x, a.y, b.x, b.y);
+        if (d <= f.radius + SLASH_THICK){
+          const {halves:hs, particles:ps} = f.slice(angle);
+          halves.push(...hs); particles.push(...ps);
+          score += 1; didHit = true;
+        }
+      }
+    }
+    if (didHit && CLEAR_AFTER_HIT) trail.length = 0;
+
+    // Cleanup sliced/triggered/off-screen
+    fruits = fruits.filter(f => !(f.dead || f.sliced));
+    bombs  = bombs .filter(b => !(b.dead || b.triggered));
+
+    // Draw remaining whole objects
+    for (const f of fruits) f.draw(ctx);
+    for (const b of bombs)  b.draw(ctx);
+
+    // Halves & particles
+    const newHalves=[]; for (const h of halves){ h.update(dt); h.draw(ctx); if (!h.dead) newHalves.push(h); }
+    halves = newHalves;
+    const newParts = []; for (const p of particles){ if (p.alive()){ p.update(dt); p.draw(ctx); newParts.push(p); } }
+    particles = newParts;
+
+    // Slash trail (glow + bright red)
+    if (trail.length >= 2){
+      ctx.lineCap = 'round';
+      // glow
+      ctx.strokeStyle = 'rgba(150,0,0,0.6)';
+      ctx.lineWidth = SLASH_GLOW_THICK * devicePixelRatio;
+      ctx.beginPath();
+      for (let i=1;i<trail.length;i++){ const p0=trail[i-1], p1=trail[i]; ctx.moveTo(p0.x,p0.y); ctx.lineTo(p1.x,p1.y); }
+      ctx.stroke();
+      // bright red
+      ctx.strokeStyle = '#ff2222';
+      ctx.lineWidth = SLASH_VIS_THICK * devicePixelRatio;
+      ctx.beginPath();
+      for (let i=1;i<trail.length;i++){ const p0=trail[i-1], p1=trail[i]; ctx.moveTo(p0.x,p0.y); ctx.lineTo(p1.x,p1.y); }
+      ctx.stroke();
+    }
+
+    // HUD
+    ctx.fillStyle='#00ffb4';
+    ctx.font = `${16*devicePixelRatio}px system-ui,Segoe UI,Arial`;
+    ctx.fillText(`Score: ${score}`, 20*devicePixelRatio, 30*devicePixelRatio);
+
+    const mm = Math.floor(timeLeft/60), ss = Math.floor(timeLeft%60);
+    const timerText = `${mm}:${ss.toString().padStart(2,'0')}`;
+    ctx.fillStyle='#fff';
+    ctx.textAlign='right';
+    ctx.fillText(timerText, canvas.width - 20*devicePixelRatio, 30*devicePixelRatio);
+    ctx.textAlign='left';
+
+    // Flashbang (white) for bombs
+    if (flashT > 0){
+      const k = flashT / FLASHBANG_DUR;
+      const alpha = (FLASHBANG_ALPHA/255) * (k*k);
+      ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+      ctx.fillRect(0,0,canvas.width, canvas.height);
+      flashT = Math.max(0, flashT - dt);
+    }
+
+    // Time up overlay
+    if (gameOver){
+      ctx.fillStyle='rgba(0,0,0,0.55)';
+      ctx.fillRect(0,0,canvas.width, canvas.height);
+      ctx.fillStyle='#ff3333';
+      ctx.font = `${38*devicePixelRatio}px system-ui,Segoe UI,Arial`;
+      ctx.textAlign='center';
+      ctx.fillText('TIME UP!', canvas.width/2, canvas.height/2 - 20*devicePixelRatio);
+      ctx.fillStyle='#fff';
+      ctx.font = `${20*devicePixelRatio}px system-ui,Segoe UI,Arial`;
+      ctx.fillText('Press R to Restart', canvas.width/2, canvas.height/2 + 20*devicePixelRatio);
+      ctx.textAlign='left';
+    }
+
+    ctx.restore(); // end shake transform
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+})();
+</script>
+</body>
+</html>
